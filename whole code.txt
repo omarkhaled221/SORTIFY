@@ -1,0 +1,215 @@
+from signal import signal, SIGTERM, SIGHUP, pause
+from rpi_lcd import LCD
+import RPi.GPIO as GPIO
+import time
+import firebase_admin
+from firebase_admin import credentials, firestore
+from ultralytics import YOLO
+import cv2
+from adafruit_servokit import ServoKit
+
+# Initialize Firebase Admin SDK
+cred = credentials.Certificate("/home/pi/Desktop/codes/sortify-sydw2v-firebase-adminsdk-7t5yi-38686b33ef.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+
+# Initialize LCD and GPIO
+lcd = LCD()
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Keypad layout (4x4 matrix)
+rows = [16, 20, 21, 5]
+cols = [6, 13, 19, 26]
+keypad_map = [
+    ['1', '2', '3', 'A'],
+    ['4', '5', '6', 'B'],
+    ['7', '8', '9', 'C'],
+    ['*', '0', '#', 'D']
+]
+
+# Set up GPIO for keypad
+for row in rows:
+    GPIO.setup(row, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+for col in cols:
+    GPIO.setup(col, GPIO.OUT)
+
+# Function to read keypad input
+def read_keypad():
+    for col_num, col_pin in enumerate(cols):
+        GPIO.output(col_pin, GPIO.HIGH)
+        for row_num, row_pin in enumerate(rows):
+            if GPIO.input(row_pin) == GPIO.HIGH:
+                time.sleep(0.1)
+                return keypad_map[row_num][col_num]
+        GPIO.output(col_pin, GPIO.LOW)
+    return None
+
+# Function for safe exit
+def safe_exit(signum, frame):
+    lcd.clear()
+    GPIO.cleanup()  # Clean up all GPIO
+    exit(1)
+
+signal(SIGTERM, safe_exit)
+signal(SIGHUP, safe_exit)
+
+# Initialize YOLO model
+model = YOLO("/home/pi/Desktop/codes/best.pt")
+item_types = {0: "cans", 1: "plastic", 2: "glass", 3: "cardboard"}
+cap = cv2.VideoCapture(0)
+
+# Motor control pins
+ENA = 17
+IN1 = 27
+IN2 = 22
+GPIO.setup(ENA, GPIO.OUT)
+GPIO.setup(IN1, GPIO.OUT)
+GPIO.setup(IN2, GPIO.OUT)
+
+def backward():
+    GPIO.output(ENA, GPIO.HIGH)
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.HIGH)
+
+def stop_motor():
+    GPIO.output(ENA, GPIO.LOW)
+
+# Initialize ServoKit
+kit = ServoKit(channels=16)
+
+def move_servo(servo_number, angle):
+    kit.servo[servo_number].angle = angle
+
+def reset_servo(servo_number):
+    kit.servo[servo_number].angle = 0
+
+# Display "Welcome to SORTIFY"
+lcd.text("Welcome to", 1)
+lcd.text("SORTIFY", 2)
+time.sleep(3)
+lcd.clear()
+
+phone_number = ""
+total_points = 0
+
+def check_phone_number(phone_number):
+    user_ref = db.collection('user').where('phone_number', '==', phone_number).limit(1)
+    user_data = user_ref.get()
+    return len(user_data) > 0
+
+def process_item():
+    global total_points
+    # Perform motor operation directly without IR sensor condition
+    backward()
+    time.sleep(5)
+    stop_motor()
+
+    ret, frame = cap.read()
+    results = model.predict(source=frame, imgsz=416, conf=0.8, verbose=False)
+
+    detected_item = "other"
+    for result in results:
+        if result.boxes:
+            for box in result.boxes:
+                class_id = int(box.cls)
+                detected_item = item_types.get(class_id, "other")
+                break
+            break
+
+    print(f"Detection: {detected_item}")
+    lcd.clear()
+    lcd.text(f"Item: {detected_item}", 1)
+
+    if detected_item in item_types.values():
+        category = next(key for key, value in item_types.items() if value == detected_item)
+        servo_number = category  # Assuming servo number corresponds to category index
+        move_servo(servo_number, 45)
+        time.sleep(3)
+        backward()
+        time.sleep(10)
+        stop_motor()
+        reset_servo(servo_number)
+
+        # Update total points for the user (replace with actual user ID retrieval logic)
+        user_ref = db.collection('user').document('user_id_here')
+        user_ref.update({"total_points": firestore.Increment(5 if detected_item in ["cans", "plastic"] else 4)})
+    else:
+        backward()
+        time.sleep(7)
+        stop_motor()
+
+        # Update total points for the user (replace with actual user ID retrieval logic)
+        user_ref = db.collection('user').document('user_id_here')
+        user_ref.update({"total_points": firestore.Increment(2)})
+
+    # Adjust global total_points variable
+    total_points += 5 if detected_item in ["cans", "plastic"] else 4 if detected_item in item_types.values() else 2
+
+try:
+    lcd.text("Press button A", 1)
+    while True:
+        key = read_keypad()
+        if key == 'A':
+            lcd.clear()
+            lcd.text("Enter number", 1)
+            lcd.text("", 2)
+            break
+        time.sleep(0.2)
+
+    while True:
+        key = read_keypad()
+        if key is not None:
+            if key.isdigit():
+                phone_number += key
+                lcd.text(phone_number, 2)
+            elif key == 'B':
+                lcd.clear()
+                if check_phone_number(phone_number):
+                    lcd.text("Enter Item", 1)
+
+                    process_item()
+
+                    lcd.clear()
+                    lcd.text("Press C to cont", 1)
+                    lcd.text("Press D to end", 2)
+
+                    while True:
+                        key = read_keypad()
+                        if key == 'C':
+                            lcd.clear()
+                            lcd.text("Enter Item", 1)
+                            break
+                        elif key == 'D':
+                            lcd.clear()
+                            lcd.text("Total Points", 1)
+                            lcd.text(str(total_points), 2)
+                            user_ref = db.collection('user').where('phone_number', '==', phone_number).limit(1)
+                            user_data = user_ref.get()
+                            if user_data:
+                                user_id = user_data[0].id
+                                db.collection('user').document(user_id).update({"total_points": total_points})
+                            time.sleep(5)
+                            lcd.clear()
+                            lcd.text("Press button A", 1)
+                            phone_number = ""
+                            total_points = 0
+                            raise KeyboardInterrupt  # Exit the program after displaying total points
+                else:
+                    lcd.text("Incorrect Number", 1)
+                    time.sleep(2)
+                    lcd.clear()
+                    lcd.text("Press button A", 1)
+            elif key == 'D':
+                phone_number = ""
+                lcd.clear()
+                lcd.text("Enter number", 1)
+                lcd.text("", 2)
+        time.sleep(0.2)
+
+except KeyboardInterrupt:
+    lcd.clear()
+    GPIO.cleanup()  # Clean up GPIO on exit
+    cap.release()
+    cv2.destroyAllWindows()
